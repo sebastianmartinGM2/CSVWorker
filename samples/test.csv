@@ -1,0 +1,5 @@
+name,age,email,signup_date
+Alice,30,alice@example.com,2023-01-02
+Bob,25,bob@example.com,2023-02-15
+Carlos,40,,2022-12-20
+Dana,28,dana@example.com,
