@@ -3,6 +3,8 @@ import multer from 'multer';
 import CsvToExcelConverter from './converter';
 import { readFile } from 'fs/promises';
 import path from 'path';
+import ExcelJS from 'exceljs';
+import BankMovementSchema from './models';
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
@@ -144,6 +146,111 @@ app.post('/convert-download-json', upload.single('file'), async (req, res) => {
     res.setHeader('Content-Disposition', 'attachment; filename="converted.json"');
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.send(jsonStr);
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Procesa un XLSX con movimientos bancarios, valida contra BankMovementSchema
+// y escribe un nuevo XLSX usando un template (escribe en las dos primeras sheets).
+app.post('/process-xlsx-template', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(req.file.buffer);
+    const sheet = wb.worksheets[0];
+    if (!sheet) return res.status(400).json({ error: 'Uploaded XLSX has no worksheets' });
+
+    // leer encabezados (fila 1)
+    const headerRow = sheet.getRow(1);
+    const headers: string[] = [];
+    headerRow.eachCell({ includeEmpty: true }, (cell, _colNumber) => {
+      const txt = (cell && (cell.text ?? cell.value)) || '';
+      headers.push(String(txt).trim());
+    });
+
+    const parsedRecords: any[] = [];
+    const validationErrors: any[] = [];
+
+    for (let r = 2; r <= sheet.rowCount; r++) {
+      const row = sheet.getRow(r);
+      // skip fully empty rows
+      const isEmpty = row.values.every((v: any) => v === null || v === undefined || v === '');
+      if (isEmpty) continue;
+
+      const rec: Record<string, any> = {};
+      for (let c = 1; c <= headers.length; c++) {
+        const key = headers[c - 1] || `col${c}`;
+        const cell = row.getCell(c);
+        const val = cell && (cell.text ?? cell.value);
+        rec[key] = typeof val === 'string' ? val.trim() : val;
+      }
+
+      const resParse = (BankMovementSchema as any).safeParse(rec);
+      if (!resParse.success) {
+        validationErrors.push({ row: r, errors: resParse.error.format ? resParse.error.format() : resParse.error.errors });
+      } else {
+        parsedRecords.push(resParse.data);
+      }
+    }
+
+    // cargar template
+    const templatePath = path.join(__dirname, '..', 'templates', 'template.xlsx');
+    const outWb = new ExcelJS.Workbook();
+    await outWb.xlsx.readFile(templatePath);
+    const outSheet1 = outWb.worksheets[0] ?? outWb.addWorksheet('Sheet1');
+    const outSheet2 = outWb.worksheets[1] ?? outWb.addWorksheet('Sheet2');
+
+    const cols = [
+      'bankId',
+      'accountId',
+      'bookingDate',
+      'valueDate',
+      'conceptCode',
+      'concept',
+      'amount',
+      'direction',
+      'currency',
+      'balance',
+      'counterpartyName',
+      'counterpartyIdType',
+      'counterpartyIdNumber',
+      'counterpartyAccount',
+      'reference',
+      'rawRowId',
+    ];
+
+    // limpiar filas existentes (dejando fila de encabezado en 1)
+    while (outSheet1.rowCount > 1) outSheet1.spliceRows(2, 1);
+    outSheet1.getRow(1).values = cols;
+
+    for (const r of parsedRecords) {
+      const rowVals = cols.map((k) => {
+        const v = r[k as keyof typeof r];
+        if (v instanceof Date) return v.toISOString().split('T')[0];
+        return v;
+      });
+      outSheet1.addRow(rowVals);
+    }
+
+    const cols2 = ['bookingDate', 'accountId', 'concept', 'amount', 'direction', 'currency'];
+    while (outSheet2.rowCount > 1) outSheet2.spliceRows(2, 1);
+    outSheet2.getRow(1).values = cols2;
+    for (const r of parsedRecords) {
+      outSheet2.addRow(cols2.map((k) => {
+        const v = r[k as keyof typeof r];
+        if (v instanceof Date) return v.toISOString().split('T')[0];
+        return v;
+      }));
+    }
+
+    const outBuf = await outWb.xlsx.writeBuffer();
+    res.setHeader('Content-Disposition', 'attachment; filename="processed.xlsx"');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    if (validationErrors.length) res.setHeader('X-Validation-Errors', encodeURIComponent(JSON.stringify(validationErrors)));
+    res.send(Buffer.from(outBuf));
   } catch (err: any) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
